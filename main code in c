@@ -1,0 +1,150 @@
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <netinet/in.h>
+#include <getopt.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <linux/if_packet.h>
+#include <net/if.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+
+#define exit_with_error(msg) do {perror(msg); exit(EXIT_FAILURE);} while(0)
+
+typedef struct {
+    uint8_t t_protocol;
+    char *source_ip;
+    char *dest_ip;
+    uint16_t source_port;
+    uint16_t dest_port;
+    char *source_if_name;
+    char *dest_if_name;
+    uint8_t source_mac[6];
+    uint8_t dest_mac[6];
+} packet_filter_t;
+
+struct sockaddr_in source_addr, dest_addr;
+
+void get_mac(char *if_name, packet_filter_t *packet_filter, char *if_type) {
+    int fd;
+    struct ifreq ifr;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) exit_with_error("socket");
+
+    ifr.ifr_addr.sa_family = AF_INET;
+    strncpy(ifr.ifr_name, if_name, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        exit_with_error("ioctl");
+    }
+
+    close(fd);
+
+    if (strcmp(if_type, "source") == 0) {
+        memcpy(packet_filter->source_mac, ifr.ifr_hwaddr.sa_data, 6);
+    } else {
+        memcpy(packet_filter->dest_mac, ifr.ifr_hwaddr.sa_data, 6);
+    }
+}
+
+uint8_t maccmp(uint8_t *mac1, uint8_t *mac2) {
+    for (uint8_t i = 0; i < 6; i++) {
+        if (mac1[i] != mac2[i]) return 0;
+    }
+    return 1;
+}
+
+void log_eth_headers(struct ethhdr *eth, FILE *lf) {
+    fprintf(lf, "\nEthernet Header\n");
+    fprintf(lf, "\t-Source MAC: %.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n",
+            eth->h_source[0], eth->h_source[1], eth->h_source[2],
+            eth->h_source[3], eth->h_source[4], eth->h_source[5]);
+
+    fprintf(lf, "\t-Destination MAC: %.2X-%.2X-%.2X-%.2X-%.2X-%.2X\n",
+            eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+            eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+
+    fprintf(lf, "\t-Protocol : %d\n", ntohs(eth->h_proto));
+}
+
+void log_ip_headers(struct iphdr *ip, FILE *lf) {
+    fprintf(lf, "\nIP Header\n");
+
+    fprintf(lf, "\t-Version : %d\n", ip->version);
+    fprintf(lf, "\t-Header Length : %d bytes\n", ip->ihl * 4);
+    fprintf(lf, "\t-Type of Service : %d\n", ip->tos);
+    fprintf(lf, "\t-Total Length : %d\n", ntohs(ip->tot_len));
+    fprintf(lf, "\t-Identification : %d\n", ntohs(ip->id));
+    fprintf(lf, "\t-Time to Live : %d\n", ip->ttl);
+    fprintf(lf, "\t-Protocol : %d\n", ip->protocol);
+    fprintf(lf, "\t-Checksum : %d\n", ntohs(ip->check));
+    fprintf(lf, "\t-Source IP : %s\n", inet_ntoa(source_addr.sin_addr));
+    fprintf(lf, "\t-Destination IP : %s\n", inet_ntoa(dest_addr.sin_addr));
+}
+
+void log_tcp_headers(struct tcphdr *tcp, FILE *lf) {
+    fprintf(lf, "\nTCP Header\n");
+    fprintf(lf, "\t-Source Port : %d\n", ntohs(tcp->source));
+    fprintf(lf, "\t-Destination Port : %d\n", ntohs(tcp->dest));
+    fprintf(lf, "\t-Sequence Number : %u\n", ntohl(tcp->seq));
+    fprintf(lf, "\t-Acknowledgement Number : %u\n", ntohl(tcp->ack_seq));
+    fprintf(lf, "\t-Header Length : %d bytes\n", tcp->doff * 4);
+}
+
+void log_udp_headers(struct udphdr *udp, FILE *lf) {
+    fprintf(lf, "\nUDP Header\n");
+    fprintf(lf, "\t-Source Port : %d\n", ntohs(udp->source));
+    fprintf(lf, "\t-Destination Port : %d\n", ntohs(udp->dest));
+    fprintf(lf, "\t-Length : %d\n", ntohs(udp->len));
+}
+
+void process_packet(uint8_t *buffer, int bufflen, packet_filter_t *filter, FILE *lf) {
+    struct ethhdr *eth = (struct ethhdr *)buffer;
+
+    if (ntohs(eth->h_proto) != 0x0800) return;
+
+    struct iphdr *ip = (struct iphdr *)(buffer + sizeof(struct ethhdr));
+
+    source_addr.sin_addr.s_addr = ip->saddr;
+    dest_addr.sin_addr.s_addr = ip->daddr;
+
+    log_eth_headers(eth, lf);
+    log_ip_headers(ip, lf);
+
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (struct tcphdr *)(buffer + sizeof(struct ethhdr) + ip->ihl * 4);
+        log_tcp_headers(tcp, lf);
+    } else if (ip->protocol == IPPROTO_UDP) {
+        struct udphdr *udp = (struct udphdr *)(buffer + sizeof(struct ethhdr) + ip->ihl * 4);
+        log_udp_headers(udp, lf);
+    }
+}
+
+int main() {
+    int sockfd;
+    uint8_t *buffer = malloc(65536);
+    if (!buffer) exit_with_error("malloc");
+    sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sockfd < 0) exit_with_error("socket");
+
+    FILE *logfile = fopen("sniffer_log.txt", "w");
+    if (!logfile) exit_with_error("fopen");
+
+    while (1) {
+        int data_size = recvfrom(sockfd, buffer, 65536, 0, NULL, NULL);
+        if (data_size < 0) exit_with_error("recvfrom");
+
+        process_packet(buffer, data_size, NULL, logfile);
+        fflush(logfile);
+    }
+}
